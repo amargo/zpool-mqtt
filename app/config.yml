@@ -1,0 +1,66 @@
+---
+sensor:
+
+  name:
+    _key: name
+    _type: str
+
+  size:
+    _key: size
+    _type: float
+    state_class: measurement
+    unit_of_measurement: 'TB'
+    value_template: |-
+      {{ ((value_json.size | float) / (1000 * 1000 * 1000)) | round(2) | d }}
+
+  alloc:
+    _key: alloc
+    _type: float
+    state_class: measurement
+    unit_of_measurement: 'TB'
+    value_template: |-
+      {{ ((value_json.alloc | float) / (1000 * 1000 * 1000)) | round(2) | d }}
+
+  free:
+    _key: free
+    _type: float
+    state_class: measurement
+    unit_of_measurement: 'TB'
+    value_template: |-
+      {{ ((value_json.free | float) / (1000 * 1000 * 1000)) | round(2) | d }}
+
+  ckpoint:
+    _key: ckpoint
+    _type: str
+    entity_category: diagnostic  
+
+  expandsz:
+    _key: expandsz
+    _type: str
+    entity_category: diagnostic     
+
+  frag:
+    _key: frag
+    _type: int
+    entity_category: diagnostic  
+    unit_of_measurement: '%'
+
+  cap:
+    _key: cap
+    _type: int
+    entity_category: diagnostic  
+
+  dedup:
+    _key: dedup
+    _type: float
+    entity_category: diagnostic  
+
+  health:
+    _key: health
+    _type: str
+    entity_category: diagnostic  
+
+  altroot:
+    _key: altroot
+    _type: str
+    entity_category: diagnostic  
