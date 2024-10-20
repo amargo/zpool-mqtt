@@ -1,4 +1,4 @@
-FROM python:3.12.4-alpine3.20
+FROM python:3.14.0a1-alpine3.20
 
 RUN apk add --no-cache zfs
 
