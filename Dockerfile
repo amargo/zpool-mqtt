@@ -1,9 +1,17 @@
-FROM python:3.14.0a3-alpine3.20
+FROM python:3.13.7-slim
 
-RUN apk add --no-cache zfs
+WORKDIR /app
 
-COPY . /opt/app
-WORKDIR /opt/app
-RUN pip install -r requirements.txt
+# Install zfsutils-linux
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends zfsutils-linux ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
-ENTRYPOINT ["python", "app/zpool-list.py"]
+# Copy requirements first for better caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+ENTRYPOINT ["python", "zpool-list.py"]
