@@ -20,4 +20,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy code
 COPY app/ .
 
-ENTRYPOINT ["python", "zpool-list.py"]
+ENTRYPOINT ["python", "-u", "zpool-list.py"]

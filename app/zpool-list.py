@@ -4,319 +4,276 @@ import os
 import signal
 import sys
 import time
-import paho.mqtt.publish as publish
+import paho.mqtt.client as mqtt
 
+from dataclasses import dataclass
 from math import ceil
-from subprocess import check_output
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional
-from yaml import safe_load
+from subprocess import run, CalledProcessError
+from typing import Any, Dict, List, Optional
 
-DEFAULT_TYPE_NAME = 'str'
-VALUE_TYPES = {
-    'float': float,
-    'int': int,
-    'str': str,
-}
+ZPOOL_CMD = os.getenv("ZPOOL_CMD", "/usr/sbin/zpool")
+ZPOOL_ARGS = ["list", "-Hp"]
 
-SensorConfig = NamedTuple(
-    'SensorConfig', [('topic', str), ('payload', Dict['str', Any])])
+MQTT_TOPIC_BASE = "zpool"
+UPDATE_INTERVAL_DEFAULT = 600
 
-__FILE = Path(__file__)
-_LOGGER = logging.getLogger(__FILE.name)
-BASE_DIR = __FILE.parent
+MODULE_FILE = Path(__file__)
+_LOGGER = logging.getLogger(MODULE_FILE.name)
 
-MQTT_CLIENT_ID = __FILE.name
-MQTT_TOPIC = 'zpool'
+def configure_logging(debug: bool) -> None:
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(stream=sys.stdout, format=fmt, level=level)
 
-update_interval = 600
-exiting_main_loop = False
+# ---------- ZFS read ----------
 
+def _check_zpool_binary() -> None:
+    if not Path(ZPOOL_CMD).exists():
+        raise FileNotFoundError(f"zpool binary not found at {ZPOOL_CMD}")
 
-class Config:
-    SENSOR_TYPES = (
-        'binary_sensor',
-        'sensor',
-    )
+def get_zpool_dict(timeout_sec: int = 5) -> Dict[str, Dict[str, Any]]:
+    """Run `zpool list -Hp` and parse into a dict keyed by pool name."""
+    _check_zpool_binary()
+    try:
+        proc = run([ZPOOL_CMD, *ZPOOL_ARGS], capture_output=True, text=True, timeout=timeout_sec, check=True)
+    except CalledProcessError as e:
+        _LOGGER.error("zpool command failed: rc=%s stderr=%s", e.returncode, e.stderr.strip())
+        return {}
+    except Exception as e:
+        _LOGGER.exception("zpool command exception: %s", e)
+        return {}
 
-    def __init__(self, alias, mqtt_state_topic: str, mqtt_availability_topic: str):
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    if not lines:
+        _LOGGER.warning("zpool output is empty")
+        return {}
 
-        # self.__serial_no = serial_no
-        self.__alias = alias
-        # self.__model = model
-        # self.__firmware = firmware
-        self.__mqtt_state_topic = mqtt_state_topic
-        self.__availability_topic = mqtt_availability_topic
+    columns = ["name", "size", "alloc", "free", "ckpoint", "expandsz", "frag", "cap", "dedup", "health", "altroot"]
+    health_map = {"ONLINE": 0, "DEGRADED": 11, "OFFLINE": 21, "UNAVAIL": 22, "FAULTED": 23, "REMOVED": 24}
 
-        with BASE_DIR.joinpath('config.yml').open() as fd:
-            raw_config = safe_load(fd)
+    out: Dict[str, Dict[str, Any]] = {}
+    for ln in lines:
+        parts = ln.split("\t")
+        if len(parts) != len(columns):
+            _LOGGER.warning("unexpected zpool line format (got %d cols): %r", len(parts), ln)
+            continue
+        pool = dict(zip(columns, parts))
 
-        self.__value_types = {}
-        self.__sensors = []
-        for sensor_type in self.__class__.SENSOR_TYPES:
-            raw_sensors = raw_config.get(sensor_type) or {}
-            sorted_raw_sensors = sorted(raw_sensors.items())
-            _LOGGER.debug(
-                f'raw_sensors len: {len(sorted_raw_sensors)}: {sorted_raw_sensors}')
+        # Parse numerics
+        for key in ["size", "alloc", "free", "frag", "cap"]:
+            val = pool.get(key, "-")
+            if val not in ("-", ""):
+                try:
+                    pool[key] = int(val)
+                except ValueError:
+                    _LOGGER.debug("non-int %s=%r", key, val)
 
-            for name, config in sorted_raw_sensors:
-                if config is None:
-                    config = {}
+        ded = pool.get("dedup", "-")
+        try:
+            pool["dedup"] = float(ded) if ded not in ("-", "") else 1.0
+        except ValueError:
+            _LOGGER.debug("non-float dedup=%r", ded)
+            pool["dedup"] = 1.0
 
-                internal_config = self.__pop_internal_config(config)
+        raw_h = pool.get("health", "UNAVAIL")
+        pool["health_text"] = raw_h
+        pool["health"] = health_map.get(raw_h, 99)  # 99 = unknown
 
-                query_key = internal_config.get('key', name)
+        out[pool["name"]] = pool
+    return out
 
-                self.__value_types[query_key] = VALUE_TYPES[internal_config.get(
-                    'type', DEFAULT_TYPE_NAME)]
-                self.__sensors.append(self.__get_device_descriptor(
-                    sensor_type, name, query_key, config))
+# ---------- HA Discovery helper ----------
 
-    def __pop_internal_config(self, config: dict) -> dict:
-        return {
-            key.lstrip('_').lower(): config.pop(key)
-            for key in list(config)
-            if key.startswith('_')
-        }
+@dataclass(frozen=True)
+class SensorDef:
+    key: str
+    name: str
+    unit: Optional[str] = None
+    device_class: Optional[str] = None
+    state_class: Optional[str] = "measurement"
+    icon: Optional[str] = None
 
-    def __get_device_descriptor(self, sensor_type: str, name: str, query_key: str, config: dict) -> SensorConfig:
-        topic = 'homeassistant/{}/zpool_{}/{}/config'.format(
-            sensor_type, self.__alias, query_key)
+# Default sensors mapped from zpool keys
+DEFAULT_SENSORS: List[SensorDef] = [
+    SensorDef("size",  "Size",  "B",  "data_size"),
+    SensorDef("alloc", "Allocated", "B", "data_size"),
+    SensorDef("free",  "Free",  "B",  "data_size"),
+    SensorDef("frag",  "Fragmentation", "%"),
+    SensorDef("cap",   "Capacity", "%"),
+    SensorDef("dedup", "Dedup Ratio"),
+    # We'll publish health (numeric code) + health_text as attribute
+    SensorDef("health", "Health Code"),
+]
 
-        payload = {
-            'device': {
-                'identifiers': [
-                    'zpool_{}'.format(self.__alias),
-                ],
-                'manufacturer': 'zpool',
-                'name': self.__alias,
-                'model': 'list'
-                # 'connections': 'host',
-            },
-            'expire_after': ceil(1.5 * update_interval),
-            'unique_id': 'zpool_{}_{}'.format(self.__alias, query_key),
-            'name': '{}_{}'.format(self.__alias, name),
-            'availability_topic': self.__availability_topic,
-            'state_topic': self.__mqtt_state_topic,
-            'json_attributes_topic': self.__mqtt_state_topic,
-            'value_template': '{{{{value_json.{}}}}}'.format(query_key),
-        }
+def build_sensor_payload(pool: str, state_topic: str, avail_topic: str, sd: SensorDef) -> Dict[str, Any]:
+    """Create a Home Assistant MQTT Discovery payload for a single sensor."""
+    unique = f"zpool_{pool}_{sd.key}"
+    payload: Dict[str, Any] = {
+        "name": f"{pool} {sd.name}",
+        "unique_id": unique,
+        "state_topic": state_topic,
+        "availability_topic": avail_topic,
+        "json_attributes_topic": state_topic,
+        "value_template": f"{{{{ value_json.{sd.key} }}}}",
+        "expire_after": ceil(1.5 * UPDATE_INTERVAL_DEFAULT),
+        "device": {
+            "identifiers": [f"zpool_{pool}"],
+            "manufacturer": "zpool",
+            "model": "list",
+            "name": pool,
+        },
+    }
+    if sd.unit:
+        payload["unit_of_measurement"] = sd.unit
+    if sd.device_class:
+        payload["device_class"] = sd.device_class
+    if sd.state_class:
+        payload["state_class"] = sd.state_class
+    if sd.icon:
+        payload["icon"] = sd.icon
+    return payload
 
-        _LOGGER.debug('Update payload config file {!r}'.format(config))
-        payload.update(config)
+# ---------- MQTT client ----------
 
-        return SensorConfig(topic, payload)
+class HaMqttClient:
+    """Persistent MQTT client with Last Will retained to availability topic."""
+class HaMqttClient:
+    def __init__(self, base_topic: str, host: str, port: int, auth: Optional[dict]):
+        self._base = base_topic
+        self._status = f"{self._base}/availability"
 
-    @property
-    def sensors(self) -> List[SensorConfig]:
-        return self.__sensors
+        client_id = f"zpool-mqtt-{base_topic.replace('/', '-')}"
+        self._client = mqtt.Client(client_id=client_id, protocol=mqtt.MQTTv311)
 
-    @property
-    def value_types(self) -> Dict[str, callable]:
-        return self.__value_types
+        if auth:
+            self._client.username_pw_set(auth.get("username"), auth.get("password"))
+        self._client.will_set(self._status, "offline", retain=True)
+        self._client.connect(host, port, keepalive=30)
+        self._client.loop_start()
 
+    def publish_online(self) -> None:
+        self._client.publish(self._status, "online", retain=True)
 
-class MqttClient:
-    def __init__(self, broker_host: str, broker_port: int, broker_auth: Optional[dict] = None):
-        self.__connection_options = {
-            'hostname': broker_host,
-            'port': broker_port,
-            'auth': broker_auth,
-            'client_id': MQTT_CLIENT_ID
-        }
+    def publish_offline(self) -> None:
+        self._client.publish(self._status, "offline", retain=True)
 
-    def publish_multiple(self, payloads: List[Dict[str, Any]], **kwargs) -> None:
-        publish.multiple(payloads, **self.__connection_options, **kwargs)
+    def publish_json(self, rel: str, obj: Any, retain: bool = False) -> None:
+        topic = f"{self._base}/{rel}" if rel else self._base
+        self._client.publish(topic, json.dumps(obj, sort_keys=True), retain=retain)
 
-    def publish_single(self, topic: str, payload: str, **kwargs) -> None:
-        publish.single(topic, payload, **self.__connection_options, **kwargs)
+    def publish_discovery(self, sensors: List[Dict[str, Any]]) -> None:
+        for topic, payload in sensors:
+            self._client.publish(topic, json.dumps(payload, sort_keys=True), retain=True)
 
+    def stop(self) -> None:
+        try:
+            self.publish_offline()
+        finally:
+            self._client.loop_stop()
+            self._client.disconnect()
 
-class HaCapableMqttClient(MqttClient):
-    def __init__(self, base_topic: str, **kwargs):
-        self.__base_topic = base_topic
-        self.__status_topic = self.get_abs_topic('availability')
-
-        self.__published_status = None
-
-        super().__init__(**kwargs)
-
-    @property
-    def status_topic(self) -> str:
-        return self.__status_topic
-
-    def get_abs_topic(self, *relative_topic: str) -> str:
-        return '/'.join([self.__base_topic] + list(relative_topic))
-
-    def __publish_status(self, status: str) -> None:
-        if status == self.__published_status:
-            return
-
-        _LOGGER.info('Publish status {!r}'.format(status))
-        self.publish_single(self.__status_topic, status, retain=True)
-
-        self.__published_status = status
-
-    def publish_online_status(self) -> None:
-        self.__publish_status('online')
-
-    def publish_offline_status(self) -> None:
-        self.__publish_status('offline')
-
-
-class LevelFilter(logging.Filter):
-    def __init__(self, filtered_level: int, **kwargs):
-        self.__filtered_level = filtered_level
-
-        super().__init__(**kwargs)
-
-    def filter(self, record: logging.LogRecord):
-        return record.levelno == self.__filtered_level
-
-
-def configure_logging(debug_logging: bool) -> None:
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setLevel(logging.DEBUG)
-    stderr_handler.addFilter(LevelFilter(logging.DEBUG))
-
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setLevel(logging.INFO)
-
-    logging.basicConfig(
-        format='%(message)s',
-        level=logging.DEBUG if debug_logging else logging.INFO,
-        handlers=[stdout_handler, stderr_handler]
-    )
-
-
-def get_zpool_dict():
-
-    columns = ["name", "size", "alloc", "free", "ckpoint",
-               "expandsz", "frag", "cap", "dedup", "health", "altroot"]
-    health = {'ONLINE': 0, 'DEGRADED': 11, 'OFFLINE': 21,
-              'UNAVAIL': 22, 'FAULTED': 23, 'REMOVED': 24}
-
-    stdout = check_output(["/usr/sbin/zpool", "list", "-Hp"],
-                          encoding='UTF-8').split('\n')
-    parsed_stdout = list(
-        map(lambda x: dict(zip(columns, x.split('\t'))), stdout))[:-1]
-
-    zpool_dict = {}
-    for pool in parsed_stdout:
-        for item in pool:
-            if item in ["size", "alloc", "free", "frag", "cap"]:
-                if pool[item] != "-":
-                    pool[item] = int(pool[item])
-            if item in ["dedup"]:
-                pool[item] = float(pool[item])
-            if item == "health":
-                pool[item] = health[pool[item]]
-        zpool_dict[pool['name']] = pool
-
-    return zpool_dict
-
+# ---------- Main ----------
 
 def main():
-    global exiting_main_loop, update_interval
+    debug = os.getenv("DEBUG", "0") == "1"
+    configure_logging(debug)
 
-    debug_logging = os.getenv('DEBUG', '0') == '1'
-    use_debugpy = os.getenv('USE_DEBUGPY', '0') == '1'
-    debugpy_port = os.getenv('DEBUGPY_PORT', 5678)
-    mqtt_port = int(os.getenv('MQTT_PORT', 1883))
-    mqtt_host = os.getenv('MQTT_HOST')
-    mqtt_user = os.getenv('MQTT_USER')
-    mqtt_password = os.getenv('MQTT_PASSWORD')
+    mqtt_host = os.getenv("MQTT_HOST")
+    mqtt_port = int(os.getenv("MQTT_PORT", "1883"))
+    mqtt_user = os.getenv("MQTT_USER")
+    mqtt_password = os.getenv("MQTT_PASSWORD")
+    update_interval = int(os.getenv("ZPOOL_INTERVAL", str(UPDATE_INTERVAL_DEFAULT)))
 
-    mqtt_auth = {'username': mqtt_user,
-                 'password': mqtt_password} if mqtt_user and mqtt_password else None
+    if not mqtt_host:
+        _LOGGER.error("MQTT_HOST is required")
+        sys.exit(2)
 
-    update_interval = int(os.getenv('ZPOOL_INTERVAL', update_interval))
+    mqtt_auth = {"username": mqtt_user, "password": mqtt_password} if mqtt_user and mqtt_password else None
 
-    _LOGGER.info('Configure logging...')
-    configure_logging(debug_logging)
+    # Initial read
+    pools = get_zpool_dict()
+    if not pools:
+        _LOGGER.warning("No zpools yet; will retry in loop")
 
-    _LOGGER.info('Get initial data from zpool...')
-    zpool_dict = get_zpool_dict()
+    # Maintain persistent client per pool
+    clients: Dict[str, HaMqttClient] = {}
 
-    configs = {}
+    def _cleanup(*_):
+        _LOGGER.info("Stopping...")
+        for c in list(clients.values()):
+            try: c.stop()
+            except Exception: pass
+        sys.exit(0)
 
-    for zpool_name, value in zpool_dict.items():
-        _LOGGER.info(f"key: {zpool_name}, value: {value}")
-        alias = zpool_name
-        _LOGGER.info('Get initial data from zpool... {}'.format(alias))
-        mqtt_client = HaCapableMqttClient(
-            '{}/{}'.format(MQTT_TOPIC, alias),
-            broker_host=mqtt_host,
-            broker_port=mqtt_port,
-            broker_auth=mqtt_auth
-        )
+    signal.signal(signal.SIGINT, _cleanup)
+    signal.signal(signal.SIGTERM, _cleanup)
 
-        mqtt_topic = mqtt_client.get_abs_topic('zpool')
-        config = Config(alias, mqtt_topic, mqtt_client.status_topic)
-        _LOGGER.info(
-            'Configuring Home Assistant via MQTT Discovery... {}:{}-{}'.format(mqtt_host, mqtt_port, alias))
+    # Bootstrap existing pools: publish discovery
+    for pool_name in pools.keys():
+        base = f"{MQTT_TOPIC_BASE}/{pool_name}"
+        cli = HaMqttClient(base, mqtt_host, mqtt_port, mqtt_auth)
+        state_topic = f"{base}/zpool"
+        avail_topic = f"{base}/availability"
 
-        discovery_msgs = [
-            {
-                'topic': sensor.topic,
-                'payload': json.dumps(sensor.payload, sort_keys=True),
-                'retain': True,
-            }
-            for sensor in config.sensors
-        ]
+        discovery_msgs = []
+        for sd in DEFAULT_SENSORS:
+            disc_topic = f"homeassistant/sensor/zpool_{pool_name}/{sd.key}/config"
+            discovery_msgs.append((disc_topic, build_sensor_payload(pool_name, state_topic, avail_topic, sd)))
 
-        _LOGGER.info(
-            'Publish sensor list to Home Assistant: {!r}'.format(discovery_msgs))
-        mqtt_client.publish_multiple(discovery_msgs)
-        configs[alias] = config
+        cli.publish_discovery(discovery_msgs)
+        cli.publish_online()
+        clients[pool_name] = cli
 
-    signal.signal(signal.SIGINT, stop_main_loop)
-    signal.signal(signal.SIGTERM, stop_main_loop)
+    # Main loop
+    while True:
+        data = get_zpool_dict()
+        if not data:
+            _LOGGER.warning("No zpool data (check /dev/zfs device & permissions); retrying...")
+            time.sleep(5)
+            continue        
 
-    exiting_main_loop = False
-    try:
-        while True:
-            zpool_dict = get_zpool_dict()
+        # Remove disappeared pools
+        for pool_name in list(clients.keys()):
+            if pool_name not in data:
+                _LOGGER.info("Pool disappeared: %s", pool_name)
+                try:
+                    clients[pool_name].publish_offline()
+                    clients[pool_name].stop()
+                finally:
+                    del clients[pool_name]
 
-            for zpool_name, value in zpool_dict.items():
-                _LOGGER.info(f"key: {zpool_name}, value: {value}")
-                alias = zpool_name
+        # Add new pools + discovery
+        for pool_name in data.keys():
+            if pool_name not in clients:
+                _LOGGER.info("New pool detected: %s", pool_name)
+                base = f"{MQTT_TOPIC_BASE}/{pool_name}"
+                cli = HaMqttClient(base, mqtt_host, mqtt_port, mqtt_auth)
+                state_topic = f"{base}/zpool"
+                avail_topic = f"{base}/availability"
+                discovery_msgs = []
+                for sd in DEFAULT_SENSORS:
+                    disc_topic = f"homeassistant/sensor/zpool_{pool_name}/{sd.key}/config"
+                    discovery_msgs.append((disc_topic, build_sensor_payload(pool_name, state_topic, avail_topic, sd)))
+                cli.publish_discovery(discovery_msgs)
+                cli.publish_online()
+                clients[pool_name] = cli
 
-                mqtt_client = HaCapableMqttClient(
-                    '{}/{}'.format(MQTT_TOPIC, alias),
-                    broker_host=mqtt_host,
-                    broker_port=mqtt_port,
-                    broker_auth=mqtt_auth
-                )
-                mqtt_topic = mqtt_client.get_abs_topic('zpool')
-                config = configs[alias]
+        # Publish states
+        for pool_name, values in data.items():
+            base = f"{MQTT_TOPIC_BASE}/{pool_name}"
+            cli = clients.get(pool_name)
+            if not cli:
+                continue
+            # Publish the full JSON once; HA sensors use value_template to pick fields
+            cli.publish_json("zpool", values, retain=False)
+            cli.publish_online()
 
-                main_loop(mqtt_client, mqtt_topic, value)
+        # Sleep w/ responsive exit
+        for _ in range(update_interval * 2):
+            time.sleep(0.5)
 
-            for _ in range(update_interval * 2):
-                time.sleep(0.5)
+# ---------- Entrypoint ----------
 
-                if exiting_main_loop:
-                    exit(0)
-
-    finally:
-        mqtt_client.publish_offline_status()
-
-
-def stop_main_loop(*args) -> None:
-    global exiting_main_loop
-    exiting_main_loop = True
-    _LOGGER.info('Exiting main loop...')
-
-
-def main_loop(mqtt_client: HaCapableMqttClient, mqtt_topic: str, values: any) -> None:
-
-    status_string = json.dumps(values, sort_keys=True)
-    _LOGGER.debug(status_string)
-
-    mqtt_client.publish_single(mqtt_topic, status_string)
-    mqtt_client.publish_online_status()
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
