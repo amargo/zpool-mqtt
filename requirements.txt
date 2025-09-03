@@ -1,2 +1,2 @@
-paho-mqtt
-pyyaml>=3.11
+paho-mqtt==1.6.1
+pyyaml==6.0.2

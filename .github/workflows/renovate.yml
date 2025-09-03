@@ -1,0 +1,26 @@
+name: Renovate
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+jobs:
+  renovate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      issues: write
+      pull-requests: write
+      security-events: read # This is needed for vulnerability alerts
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Run Renovate
+        uses: renovatebot/github-action@v43.0.8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          configurationFile: renovate.json
+        env:
+          LOG_LEVEL: debug
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
