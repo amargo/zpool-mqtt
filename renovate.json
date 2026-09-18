@@ -3,13 +3,18 @@
   "extends": [
     "config:recommended",
     "config:best-practices",
-    ":ignoreModulesAndTests",
     "group:monorepos",
     "group:recommended",
     ":pinDigestsDisabled",
-    "schedule:weekends",
-    "workarounds:all"
+    "workarounds:all",
+    "abandonments:recommended"
   ],
+  "timezone": "Europe/Budapest",
+  "schedule": [
+    "after 1am and before 5am on friday"
+  ],
+  "prHourlyLimit": 0,
+  "prConcurrentLimit": 10,
   "enabledManagers": [
     "dockerfile",
     "pip_requirements",
@@ -17,9 +22,15 @@
   ],
   "dependencyDashboard": true,
   "dependencyDashboardTitle": "📦 Dependency Dashboard",
-  "abandonmentThreshold": "365",
   "osvVulnerabilityAlerts": true,
   "platformAutomerge": true,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "automerge": true,
+    "labels": [
+      "security"
+    ]
+  },
   "packageRules": [
     {
       "matchDatasources": [
@@ -63,8 +74,8 @@
       "matchUpdateTypes": [
         "minor"
       ],
-      "automerge": true,
-      "groupName": "🐍 Python minor updates"
+      "groupName": "🐍 Python minor updates",
+      "automerge": true
     },
     {
       "matchManagers": [
@@ -84,33 +95,29 @@
         "minor",
         "patch"
       ],
-      "automerge": true,
-      "groupName": "⚡ GitHub Actions updates"
+      "groupName": "⚡ GitHub Actions updates",
+      "automerge": true
     },
     {
       "matchUpdateTypes": [
         "patch"
       ],
-      "automerge": true,
-      "groupName": "🔖 Patch updates"
+      "groupName": "🔖 Patch updates",
+      "automerge": true
     },
     {
-      "matchPackagePatterns": [
+      "description": "Ritkán karbantartott függőségek: automerge rövid érleléssel",
+      "matchPackageNames": [
         "coloredlogs",
         "python-dateutil"
       ],
-      "labels": ["abandoned-dependency"],
+      "labels": [
+        "abandoned-dependency"
+      ],
       "automerge": true,
-      "stabilityDays": 3,
-      "prPriority": 5
+      "minimumReleaseAge": "3 days",
+      "prPriority": 5,
+      "abandonmentThreshold": "10 years"
     }
-  ],
-  "vulnerabilityAlerts": {
-    "labels": [
-      "security"
-    ],
-    "osvVulnerabilityAlerts": true,
-    "automerge": true,
-    "enabled": true
-  }
+  ]
 }
