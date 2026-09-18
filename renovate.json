@@ -106,7 +106,7 @@
       "automerge": true
     },
     {
-      "description": "Ritkán karbantartott függőségek: automerge rövid érleléssel",
+      "description": "Rarely maintained dependencies: automerge after a short cooldown",
       "matchPackageNames": [
         "coloredlogs",
         "python-dateutil"
